@@ -212,7 +212,7 @@ public abstract class RateLimiter {
 
   /**
    * The underlying timer; used both to measure elapsed time and sleep as necessary. A separate
-   * object to facilitate testing.
+   * object to facilitate(促进，推动，使便利，使更容易) testing.
    */
   private final SleepingStopwatch stopwatch;
 
@@ -447,7 +447,7 @@ public abstract class RateLimiter {
   abstract long queryEarliestAvailable(long nowMicros);
 
   /**
-   * Reserves the requested number of permits and returns the time that those permits can be used
+   * Reserves 预定 the requested number of permits and returns the time that those permits can be used
    * (with one caveat).
    *
    * @return the time that the permits may be used, or, if the permits may be used immediately, an

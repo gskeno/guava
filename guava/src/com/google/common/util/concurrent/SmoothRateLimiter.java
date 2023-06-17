@@ -30,8 +30,8 @@ abstract class SmoothRateLimiter extends RateLimiter {
    * How is the RateLimiter designed, and why?
    *
    * The primary feature of a RateLimiter is its "stable rate", the maximum rate that it should
-   * allow in normal conditions. This is enforced by "throttling" incoming requests as needed. For
-   * example, we could compute the appropriate throttle time for an incoming request, and make the
+   * allow in normal conditions. This is enforced 实施执行 by "throttling" incoming requests as needed. For
+   * example, we could compute the appropriate throttle 节流阀 time for an incoming request, and make the
    * calling thread wait for that time.
    *
    * The simplest way to maintain a rate of QPS is to keep the timestamp of the last granted
@@ -211,7 +211,9 @@ abstract class SmoothRateLimiter extends RateLimiter {
      * (when permits == maxPermits)
      */
     private double slope;
-
+    /**
+     * 预热期与稳定期令牌数临界值
+     */
     private double thresholdPermits;
     private double coldFactor;
 
@@ -222,13 +224,30 @@ abstract class SmoothRateLimiter extends RateLimiter {
       this.coldFactor = coldFactor;
     }
 
+    /**
+     *
+     * @param permitsPerSecond 每秒生成令牌数
+     * @param stableIntervalMicros 稳定期令牌生成间隔时间
+     */
     @Override
     void doSetRate(double permitsPerSecond, double stableIntervalMicros) {
       double oldMaxPermits = maxPermits;
+      // 冷却期产生令牌时间间隔 = 稳定期令牌生成间隔时间 * 冷却期因子
       double coldIntervalMicros = stableIntervalMicros * coldFactor;
+      // 临界值 = 0.5 * 预热时间 / 稳定期令牌生成间隔时间
+      // 源码的注释中说，从maxPermits到thresholdPermits，需要用warmupPeriod的时间，而从thresholdPermits到0需要warmupPeriod一半的时间
       thresholdPermits = 0.5 * warmupPeriodMicros / stableIntervalMicros;
+      // 最大令牌数 = 临界值 + 2 * 预热时间 / (稳定期令牌生成间隔时间 + 冷却期产生令牌时间间隔)
+      // 为什么是这么算出来的呢？源码的注释已经给出了推导过程。因为坐标系中右边的梯形面积就是预热的时间，即：
+      // warmupPeriodMicros = 0.5 * (stableInterval + coldInterval) * (maxPermits - thresholdPermits)
+      // 因此可以推导求出maxPermits：
       maxPermits =
           thresholdPermits + 2.0 * warmupPeriodMicros / (stableIntervalMicros + coldIntervalMicros);
+      // 咳咳，这里其实仔细算算，一顿操作猛如虎，因为coldFactor默认为3，所以其实：
+      // maxPermits = warmupPeriodMicros / stableIntervalMicros
+      // thresholdPermits = maxPermits / 2
+
+      // 斜率
       slope = (coldIntervalMicros - stableIntervalMicros) / (maxPermits - thresholdPermits);
       if (oldMaxPermits == Double.POSITIVE_INFINITY) {
         // if we don't special-case this, we would get storedPermits == NaN, below
@@ -241,11 +260,24 @@ abstract class SmoothRateLimiter extends RateLimiter {
       }
     }
 
+    /**
+     * 计算令牌桶的等待时间
+     * 怎么计算时间呢？我们用给的这个坐标系来计算。
+     * 其中纵坐标是生成令牌的间隔时间，横坐标是桶中的令牌数。
+     * 我们要计算消耗掉permitsToTake个令牌数需要的时间，实际上就是求坐标系中的面积
+     * 所以storedPermitsToWaitTime方法实际上就是求三种情况下的面积
+     *
+     * @param storedPermits 令牌桶中存在的令牌数
+     * @param permitsToTake 本次消耗掉的令牌数
+     * @return
+     */
     @Override
     long storedPermitsToWaitTime(double storedPermits, double permitsToTake) {
+      // 当前令牌桶内的令牌数和临界值的差值
       double availablePermitsAboveThreshold = storedPermits - thresholdPermits;
       long micros = 0;
       // measuring the integral on the right part of the function (the climbing line)
+      // 高于临界值，则需要根据预热算法计算时间
       if (availablePermitsAboveThreshold > 0.0) {
         double permitsAboveThresholdToTake = min(availablePermitsAboveThreshold, permitsToTake);
         // TODO(cpovirk): Figure out a good name for this variable.
@@ -319,13 +351,14 @@ abstract class SmoothRateLimiter extends RateLimiter {
 
   /**
    * The interval between two unit requests, at our stable rate. E.g., a stable rate of 5 permits
-   * per second has a stable interval of 200ms.
+   * per second has a stable interval of 200ms. 相邻两个令牌生成的稳定速度，微秒单位
    */
   double stableIntervalMicros;
 
   /**
    * The time when the next request (no matter its size) will be granted. After granting a request,
    * this is pushed further in the future. Large requests push this further than small requests.
+   * 下一个请求可以被允许获取令牌的时间点，单位是微秒。
    */
   private long nextFreeTicketMicros = 0L; // could be either in the past or future
 
@@ -356,14 +389,22 @@ abstract class SmoothRateLimiter extends RateLimiter {
   @Override
   final long reserveEarliestAvailable(int requiredPermits, long nowMicros) {
     resync(nowMicros);
+    // 本次请求可以获取令牌的时间点，那自然是nextFreeTicketMicros啦
     long returnValue = nextFreeTicketMicros;
+    // 本次实际获取的令牌数量。比较一下需要的数量和当前桶中的数量，只能两者取其小了。
     double storedPermitsToSpend = min(requiredPermits, this.storedPermits);
+    // 领取后还需要预获取的令牌数
     double freshPermits = requiredPermits - storedPermitsToSpend;
+    // 分别计算storedPermitsToSpend和freshPermits的等待时间
+    // 预获取的令牌还需要占用的时间 = 预获取的令牌数 * 令牌生成间隔
+    // 通过storedPermitsToWaitTime方法计算本次获取令牌消耗的时间
+    // 在使用默认限流器时，直接返回0。如果是预热限流器，那就需要根据限流器当前的状态计算额外需要等待的时间
     long waitMicros =
         storedPermitsToWaitTime(this.storedPermits, storedPermitsToSpend)
             + (long) (freshPermits * stableIntervalMicros);
-
+    // 重置nextFreeTicketMicros，即当前的nextFreeTicketMicros+新增的等待时间
     this.nextFreeTicketMicros = LongMath.saturatedAdd(nextFreeTicketMicros, waitMicros);
+    // 重置storedPermits，减去本次消耗的令牌数，就是当前桶中剩余的令牌数
     this.storedPermits -= storedPermitsToSpend;
     return returnValue;
   }
@@ -382,11 +423,17 @@ abstract class SmoothRateLimiter extends RateLimiter {
    */
   abstract double coolDownIntervalMicros();
 
-  /** Updates {@code storedPermits} and {@code nextFreeTicketMicros} based on the current time. */
+  /** Updates {@code storedPermits} and {@code nextFreeTicketMicros} based on the current time.
+   * 根据当前时间更新桶内令牌数量
+   */
   void resync(long nowMicros) {
     // if nextFreeTicket is in the past, resync to now
     if (nowMicros > nextFreeTicketMicros) {
+      // 当前时间距离上一次请求通过时间隔了nowMicros - nextFreeTicketMicros 微秒
+      // 而每个令牌生成需要coolDownIntervalMicros 微秒
+      // newPermits表示该段时间内应该生产的令牌数量
       double newPermits = (nowMicros - nextFreeTicketMicros) / coolDownIntervalMicros();
+      // 令牌数量不能超过最大值限制maxPermits
       storedPermits = min(maxPermits, storedPermits + newPermits);
       nextFreeTicketMicros = nowMicros;
     }
